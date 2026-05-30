@@ -11,30 +11,49 @@ from utils import (
 
 
 def optimized_loop(model, input_ids, n_steps):
-    # TODO: fix the performance issues you found — changes may include
-    # both `optimized_loop` and `generate_optimized`
-    generated_ids = input_ids.clone()
-    generated_tokens = []
-    for _ in range(n_steps):
-        outputs = model(input_ids=generated_ids)
-        next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1)
-        token_value = next_token_id.item()
-        generated_tokens.append(token_value)
-        generated_ids = torch.cat([generated_ids, next_token_id.unsqueeze(0)], dim=1)
-    return generated_tokens
+    # Fix 1: KV cache — pass only the new token each step instead of the full
+    # growing sequence, so each decode step costs O(1) MLP work rather than
+    # O(prompt + steps so far).
+    # Fix 2: defer .item() to avoid a GPU→CPU sync inside the hot loop.
+    token_tensors = []
+    past_key_values = None
+    current_input = input_ids
+
+    with torch.inference_mode():
+        for _ in range(n_steps):
+            outputs = model(
+                input_ids=current_input,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            next_token = outputs.logits[:, -1, :].argmax(dim=-1)  # shape (1,)
+            token_tensors.append(next_token)
+            current_input = next_token.unsqueeze(1)  # shape (1, 1) for next step
+
+    return [t.item() for t in token_tensors]
 
 
 def profile(loop_fn, model, input_ids, trace_name: str):
-    # TODO: wrap loop_fn(model, input_ids, PROFILE_STEPS) with torch.profiler,
-    # print the summary table, and export a Chrome trace to RESULTS_DIR / trace_name
-    pass
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+    ) as prof:
+        loop_fn(model, input_ids, PROFILE_STEPS)
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+    prof.export_chrome_trace(str(RESULTS_DIR / trace_name))
 
 
 def generate_optimized(optimized_trace_name: str) -> float:
-    # TODO: load the model (consider dtype and other loading options),
-    # then call profile() and time_generation() on optimized_loop.
-    # Return the elapsed time from time_generation so main() can print a speedup.
-    pass
+    # Fix 3: float16 halves memory traffic and enables tensor-core paths,
+    # which is a meaningful multiplier on top of the KV-cache win.
+    model = build_model(torch.float16)
+    input_ids = get_input_ids()
+    profile(optimized_loop, model, input_ids, optimized_trace_name)
+    return time_generation(optimized_loop, model, input_ids, "Optimized")
 
 
 def main():
