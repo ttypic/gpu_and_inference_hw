@@ -12,8 +12,7 @@ import torch
 
 def lowest_ai_fn(x: torch.Tensor) -> torch.Tensor:
     """Lowest arithmetic intensity baseline (0 FLOP/Byte)."""
-    # TODO (1 line): implement a lowest-AI op
-    pass
+    return x.clone()
 
 
 # TASK 1b: Implement a function with configurable arithmetic intensity.
@@ -37,10 +36,12 @@ def make_compute_fn(num_ops: int, compiled: bool = True):
     """Return an eager or compiled function whose work scales with num_ops."""
 
     def fn(x: torch.Tensor) -> torch.Tensor:
-        pass
+        acc = x.clone()
+        for _ in range(num_ops):
+            acc = acc * x + x
+        return acc
 
-    # TODO (1 line): return either `fn` or `torch.compile(fn)` based on `compiled`
-    pass
+    return torch.compile(fn) if compiled else fn
 
 
 # ============================================================================
@@ -62,8 +63,16 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
         fn(*args)
     torch.cuda.synchronize()
 
-    # TODO: time `rep` runs using CUDA events and return median latency (ms)
-    pass
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    for i in range(rep):
+        start_events[i].record()
+        fn(*args)
+        end_events[i].record()
+    torch.cuda.synchronize()
+
+    times = sorted(s.elapsed_time(e) for s, e in zip(start_events, end_events))
+    return float(times[len(times) // 2])
 
 
 # TASK 3: Compute element-wise operation metrics from measured runtime.
@@ -83,8 +92,18 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
 
 
 def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, variant):
-    # TODO: compute total FLOPs, arithmetic intensity, and achieved FLOP/s
-    pass
+    total_flops = num_elements * num_ops * 2  # mul + add per iteration
+
+    if variant == "compiled":
+        # Fused kernel: each element read once, written once
+        total_bytes = num_elements * bytes_per_element * 2
+    else:
+        # Eager: each iteration launches separate mul and add kernels,
+        # each with 2 reads + 1 write → 6 element accesses per iteration
+        total_bytes = num_elements * bytes_per_element * 6 * num_ops
+
+    ai = total_flops / total_bytes
+    achieved_flops = total_flops / (ms * 1e-3)
     return total_flops, ai, achieved_flops
 
 
